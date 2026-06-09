@@ -64,6 +64,11 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
         self.db.executescript(SCHEMA)
+        # исходный файл храню, чтобы после улучшения разбора можно было пересобрать документ
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(documents)")}
+        if "data" not in cols:
+            self.db.execute("ALTER TABLE documents ADD COLUMN data BLOB")
+            self.db.commit()
         # версия курса растёт при каждом изменении: по ней сбрасывается кэш поискового индекса
         self.versions: dict[int, int] = {}
 
@@ -123,12 +128,30 @@ class Store:
         if not chunks:
             raise ValueError("в файле не нашлось текста (скан без текстового слоя?)")
         with self.tx() as db:
-            doc_id = db.execute("INSERT INTO documents(course_id, name, sha1, added, markdown) VALUES (?,?,?,?,?)",
-                                (course_id, name, sha1, now(), md)).lastrowid
+            doc_id = db.execute("INSERT INTO documents(course_id, name, sha1, added, markdown, data) VALUES (?,?,?,?,?,?)",
+                                (course_id, name, sha1, now(), md, data)).lastrowid
             db.executemany("INSERT INTO chunks(doc_id, ord, section, text) VALUES (?,?,?,?)",
                            [(doc_id, i, c.section, c.text) for i, c in enumerate(chunks)])
         self._bump(course_id)
         return {"id": doc_id, "chunks": len(chunks), "duplicate": False}
+
+    def reprocess(self, doc_id: int) -> dict:
+        """Пересобрать документ из исходного файла (после улучшения разбора PDF).
+        Карточки из старых фрагментов удаляются вместе с ними."""
+        r = self.db.execute("SELECT course_id, name, data FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if not r:
+            raise KeyError(doc_id)
+        if r["data"] is None:
+            raise ValueError("исходный файл не сохранён: документ загружен старой версией, загрузите его заново")
+        md = to_markdown(r["name"], r["data"])
+        chunks = split_markdown(md, Path(r["name"]).stem)
+        with self.tx() as db:
+            db.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+            db.execute("UPDATE documents SET markdown = ? WHERE id = ?", (md, doc_id))
+            db.executemany("INSERT INTO chunks(doc_id, ord, section, text) VALUES (?,?,?,?)",
+                           [(doc_id, i, c.section, c.text) for i, c in enumerate(chunks)])
+        self._bump(r["course_id"])
+        return {"id": doc_id, "chunks": len(chunks)}
 
     def documents(self, course_id: int) -> list[dict]:
         rows = self.db.execute("""

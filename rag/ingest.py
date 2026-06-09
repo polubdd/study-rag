@@ -30,7 +30,12 @@ def to_markdown(name: str, data: bytes) -> str:
         return guess_headings(_decode(data))
     if ext == ".docx":
         return docx_to_markdown(data)
-    return guess_headings(pdf_text(data))
+    try:
+        import pymupdf  # noqa: F401  — с ним формулы, индексы и заголовки по размеру шрифта
+    except ImportError:
+        return guess_headings(pdf_text(data))
+    from .pdf import pdf_to_markdown
+    return pdf_to_markdown(data)
 
 
 def _decode(data: bytes) -> str:
