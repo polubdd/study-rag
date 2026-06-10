@@ -23,6 +23,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from . import llm
 from .bm25 import BM25
 from .chunk import Chunk
+from .synonyms import build_map, expand
 from .text import normalize
 
 
@@ -35,10 +36,12 @@ class Hit:
 
 class HybridIndex:
     def __init__(self, chunks: list[Chunk], rrf_k: int = 60, use_embeddings: bool | None = None,
-                 methods: tuple[str, ...] = ("bm25", "chars", "dense")):
+                 methods: tuple[str, ...] = ("bm25", "chars", "dense"), synonyms: bool = True,
+                 extra_synonyms: list[list[str]] | None = None):
         self.chunks = chunks
         self.rrf_k = rrf_k
         self.methods = methods
+        self.synonyms = build_map(extra_synonyms) if synonyms else {}
         # заголовок раздела добавляю к тексту: часто термин есть только в нём
         texts = [f"{c.section}\n{c.text}" for c in chunks]
         self.bm25 = BM25(texts)
@@ -52,13 +55,15 @@ class HybridIndex:
             self.E = E / np.linalg.norm(E, axis=1, keepdims=True)
 
     def _rankings(self, query: str) -> dict[str, np.ndarray]:
+        dense_query = query  # эмбеддинги синонимы и так понимают, им исходный вопрос
+        query = expand(query, self.synonyms)
         out = {}
         if "bm25" in self.methods:
             out["bm25"] = np.array(self.bm25.scores(query))
         if "chars" in self.methods:
             out["chars"] = cosine_similarity(self.tfidf.transform([query]), self.X)[0]
         if self.E is not None:
-            q = np.array(llm.embed([query])[0], dtype=np.float32)
+            q = np.array(llm.embed([dense_query])[0], dtype=np.float32)
             out["dense"] = self.E @ (q / np.linalg.norm(q))
         return out
 
@@ -81,6 +86,7 @@ class HybridIndex:
         """Есть ли в конспектах хоть что-то по вопросу."""
         if not hits:
             return False
-        best_bm25 = max(self.bm25.scores(query)) if "bm25" in self.methods else 0
+        query = expand(query, self.synonyms)
+        best_bm25 = max(self.bm25.scores(query))
         best_chars = float(cosine_similarity(self.tfidf.transform([query]), self.X)[0].max())
         return self.bm25.coverage(query) >= 0.34 and (best_bm25 >= 2.0 or best_chars >= 0.25)
