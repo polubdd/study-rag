@@ -88,6 +88,66 @@ def test_cp1251_text():
     assert "Ранг" in to_markdown("old.txt", "Ранг матрицы\n\nРанг — число.".encode("cp1251"))
 
 
+# --- PDF с формулами
+
+def test_tex_font_symbols():
+    from rag.pdf import fix_negations, map_font_text
+    assert map_font_text("X", "CMEX10") == "∑" and map_font_text("R", "MSBM10") == "ℝ"
+    assert map_font_text("P", "CMSY10") == "𝒫" and map_font_text("uv", "CMEX10") == ""
+    assert fix_negations("x ̸= y") == "x ≠ y"
+
+
+def test_pdf_row_assembly_sub_sup_and_limits():
+    from rag.pdf import Row, Span, _row_text, _rows
+    body = 12
+    spans = [
+        Span("ρ(x, y) =", 0, 50, 0, 12, 10, 12, False),
+        Span("∑", 55, 65, -2, 16, 14, 12, False, big_op=True),   # знак суммы ниже базовой линии
+        Span("n", 57, 62, -8, -1, -2, 8, False),                  # предел сверху
+        Span("i=1", 55, 66, 15, 22, 21, 8, False),                # предел снизу
+        Span("|ξ", 70, 80, 0, 12, 10, 12, False),
+        Span("i", 80, 84, 6, 13, 13, 8, False),                   # нижний индекс
+        Span("|", 85, 88, 0, 12, 10, 12, False),
+        Span("2", 88, 92, -3, 4, 5, 8, False),                    # степень
+    ]
+    (row,) = _rows(spans, body)
+    assert _row_text(row) == "ρ(x, y) = ∑_{i=1}^{n} |ξ_{i}|^{2}"
+
+
+def test_pdf_fraction_exponent():
+    from rag.pdf import Row, Span, _row_text
+    r = Row(10, 12)
+    r.add("main", Span(")", 0, 4, 0, 12, 10, 12, False))
+    r.add("sup", Span("1", 5, 9, -4, 2, 2, 8, False))
+    r.add("sup", Span("p", 5, 9, 2, 8, 7, 8, False))
+    assert _row_text(r) == ")^{1/p}"
+
+
+def test_lecture_style_definition_cards():
+    ch = Chunk("x", "Глава 24 / 24.1 Метрическое пространство",
+               "**Метрическим пространством** M называется некоторое множество, на котором определено расстояние.\n\n"
+               "**Nota bene** Отображение ρ называется расстоянием.\n\n"
+               "Полученное метрическое пространство называется пространством Гильберта.\n\n"
+               "Унитарным называется оператор υ, сохраняющий скалярное произведение.\n\n"
+               "Метрическая форма называется положительно определенной, если g(x, x) > 0.")
+    fronts = [c.front for c in from_chunk(ch)]
+    assert fronts == ["Что называется метрическим пространством?", "Что называется расстоянием?",
+                      "Какой оператор называется унитарным?",
+                      "Когда метрическая форма называется положительно определенной?"]
+
+
+def test_definition_answer_prefers_the_asked_term():
+    s = Store()
+    cid = s.create_course("x")
+    md = ("# Глава 24\n\n## 24.1 Метрическое пространство\n\n"
+          "**Метрическим пространством** M называется множество, на котором определено отображение ρ со свойствами:\n\n"
+          "D1. ρ(x, y) ≥ 0;\n\nD2. ρ(x, y) = ρ(y, x).\n\n"
+          "Полученное метрическое пространство называется координатным пространством Гильберта.")
+    s.add_document(cid, "l.md", md.encode())
+    a = answer("Что такое метрическое пространство", HybridIndex(s.chunks(cid), use_embeddings=False), use_llm=False)
+    assert a.text.startswith("**Метрическим пространством**") and "D2." in a.text and "Гильберта" not in a.text
+
+
 # --- хранилище
 
 def test_duplicate_upload_is_detected(course):

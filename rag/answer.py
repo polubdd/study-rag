@@ -18,7 +18,7 @@ from .synonyms import expand
 from .text import sentences, tokenize
 
 DEFINITION = re.compile(r"\s[—–-]\s|\bэто\b|\bназывает|\bназывают|\bопределяется")
-WHAT_IS = re.compile(r"^\s*(что такое|что есть|определени|дай(те)? определение|кто такой)", re.I)
+WHAT_IS = re.compile(r"^\s*(что так(ое|ая|ой)|что есть|что называ|как называ|определени|дай(те)? определение|кто такой)", re.I)
 
 PROMPT = """Ты помогаешь студенту готовиться к экзамену. Ответь на вопрос ТОЛЬКО по фрагментам его конспекта.
 Правила:
@@ -50,7 +50,32 @@ def _sources(hits: list[Hit]) -> list[dict]:
              "text": h.chunk.text, "score": h.score, "ranks": h.ranks} for i, h in enumerate(hits)]
 
 
-def extractive(question: str, hits: list[Hit], idf: dict[str, float], max_sentences: int = 3) -> str:
+def _definition_weight(sentence: str, q: set[str], pos: int) -> float:
+    """Насколько предложение — определение ИСКОМОГО термина.
+
+    «Метрическим пространством M называется множество…» определяет метрическое пространство,
+    а «Полученное метрическое пространство называется пространством Гильберта» — другое понятие,
+    хотя слова вопроса есть в обоих. Определяемый термин берётся тем же разбором, что и для карточек.
+    """
+    from .cards import CALLED, DEF, _called_card, _strip_label
+    plain, bold = _strip_label(sentence)
+    card = _called_card(plain.strip(), bold, None)
+    if card is None and CALLED.match(plain.strip()):
+        return 0.6  # «Полученное пространство называется…» — называют что-то другое
+    term = card.term if card else (DEF.match(plain.strip()).group("term") if DEF.match(plain.strip()) else None)
+    content = q - {"называ", "называет", "определен", "определени"}
+    if term:
+        t = set(tokenize(term)) | set(tokenize(card.front if card else ""))
+        # «что такое ранг матрицы» -> «Ранг — максимальное число строк матрицы»: термин содержит часть
+        # вопроса, остальное есть в самом определении
+        if content and t & content and content - t <= set(tokenize(plain)):
+            return 3.0  # определение именно того, о чём спросили
+        return 0.6  # определение, но чего-то другого
+    return 1.3 if pos == 0 and DEFINITION.search(sentence) else 1.0
+
+
+def extractive(question: str, hits: list[Hit], idf: dict[str, float], max_sentences: int = 3,
+               synonyms: dict | None = None) -> str:
     """Жадный выбор предложений по покрытию вопроса.
 
     Каждое следующее предложение берётся за НОВЫЕ слова вопроса, которые
@@ -58,19 +83,23 @@ def extractive(question: str, hits: list[Hit], idf: dict[str, float], max_senten
     выбирались два определения собственного вектора, а предложение про PCA
     проигрывало, хотя только оно и отвечает на вопрос.
     """
-    q = set(tokenize(question))
+    q_orig = set(tokenize(question))
+    # синонимы помогают найти предложение («momentum» -> «импульс»), но определение проверяю по исходному вопросу
+    q = q_orig | set(tokenize(expand(question, synonyms))) if synonyms else q_orig
     wants_definition = bool(WHAT_IS.search(question))
     cands = []
+    by_rank: dict[int, list[str]] = {}
     for rank, h in enumerate(hits):
         section = set(tokenize(h.chunk.section))
-        for pos, s in enumerate(sentences(h.chunk.text)):
+        by_rank[rank] = sentences(h.chunk.text)
+        for pos, s in enumerate(by_rank[rank]):
             toks = set(tokenize(s))
             if not toks:
                 continue
             # множитель качества: короткие предложения, первые в разделе, из лучших фрагментов
             quality = 1 / math.sqrt(len(toks) + 1) / (1 + 0.25 * rank) / (1 + 0.1 * pos)
-            if wants_definition and pos == 0 and DEFINITION.search(s):
-                quality *= 1.8
+            if wants_definition:
+                quality *= _definition_weight(s, q_orig, pos)
             cands.append({"rank": rank, "pos": pos, "s": s, "toks": toks & q, "section": section & q, "quality": quality})
 
     def gain(c, covered):
@@ -99,7 +128,24 @@ def extractive(question: str, hits: list[Hit], idf: dict[str, float], max_senten
         covered |= best["toks"] | (best["section"] if best["pos"] == 0 else set())
         cands.remove(best)
     picked.sort(key=lambda c: (c["rank"], c["pos"]))  # в порядке источников и текста — так читается связно
-    return " ".join(f"{c['s']} [{c['rank'] + 1}]" for c in picked)
+    parts = []
+    for c in picked:
+        text = c["s"]
+        if text.rstrip().endswith(":"):
+            # «…обладающее следующими свойствами (аксиомами):» без самих аксиом бесполезно —
+            # добираю следующие короткие строки (пункты, формулы) того же фрагмента
+            tail = []
+            for nxt in by_rank[c["rank"]][c["pos"] + 1:c["pos"] + 6]:
+                if len(nxt) > 160 or any(p["rank"] == c["rank"] and p["s"] == nxt for p in picked):
+                    break
+                list_item = re.match(r"^([A-ZА-Я]?\d+[.)]|[-•]|\(?[a-zа-я]\))\s", nxt)
+                formula = re.search(r"[=≤≥<>∑∫∈⇔→]", nxt) and len(re.findall(r"[а-яё]{4,}", nxt.lower())) <= 2
+                if not (list_item or formula):
+                    break  # дальше уже обычный текст — продолжение раскрыто
+                tail.append(nxt)
+            text = "\n".join([text] + tail)
+        parts.append(f"{text} [{c['rank'] + 1}]")
+    return "\n".join(parts) if any("\n" in p for p in parts) else " ".join(parts)
 
 
 def check_citations(text: str, n_sources: int) -> list[str]:
@@ -122,7 +168,7 @@ def answer(question: str, index: HybridIndex, k: int = 4, use_llm: bool | None =
                       ["похожих фрагментов почти нет — возможно, этой темы нет в загруженных конспектах"])
     sources = _sources(hits)
     # предложения ищу по вопросу вместе с синонимами: на «momentum» ответ в конспекте написан про «импульс»
-    fallback = extractive(expand(question, index.synonyms), hits, index.bm25.idf)
+    fallback = extractive(question, hits, index.bm25.idf, synonyms=index.synonyms)
     if use_llm is None:
         use_llm = llm.enabled() or call is not None
     if not use_llm:
