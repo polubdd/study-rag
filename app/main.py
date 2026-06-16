@@ -103,7 +103,8 @@ async def upload(course_id: int, files: list[UploadFile] = File(...)):
             results.append({"name": f.filename, "error": str(e)})
         except Exception:
             results.append({"name": f.filename, "error": "не удалось прочитать файл"})
-    cards = svc.generate_cards(course_id) if any("id" in r and not r.get("duplicate") for r in results) else None
+    changed = any("id" in r and not r.get("duplicate") for r in results)
+    cards = svc.generate_cards(course_id) if changed else None
     return {"files": results, "cards": cards}
 
 
@@ -113,6 +114,18 @@ def document(doc_id: int):
     if not d:
         raise HTTPException(404)
     return d
+
+
+@app.post("/api/documents/{doc_id}/reprocess")
+def reprocess(doc_id: int):
+    doc = svc.store.document(doc_id)
+    if not doc:
+        raise HTTPException(404)
+    try:
+        r = svc.store.reprocess(doc_id)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {**r, "cards": svc.generate_cards(doc["course_id"])}
 
 
 @app.delete("/api/documents/{doc_id}", status_code=204)

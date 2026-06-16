@@ -119,7 +119,13 @@ class Store:
         if not self.db.execute("SELECT 1 FROM courses WHERE id = ?", (course_id,)).fetchone():
             raise KeyError(course_id)
         sha1 = hashlib.sha1(data).hexdigest()
-        dup = self.db.execute("SELECT id FROM documents WHERE course_id = ? AND sha1 = ?", (course_id, sha1)).fetchone()
+        dup = self.db.execute("SELECT id, data FROM documents WHERE course_id = ? AND sha1 = ?", (course_id, sha1)).fetchone()
+        if dup and dup["data"] is None:
+            # документ загружен старой версией без исходника: повторная загрузка пересобирает его новым разбором
+            with self.tx() as db:
+                db.execute("UPDATE documents SET data = ? WHERE id = ?", (data, dup["id"]))
+            r = self.reprocess(dup["id"])
+            return {**r, "duplicate": False, "reprocessed": True}
         if dup:
             n = self.db.execute("SELECT COUNT(*) FROM chunks WHERE doc_id = ?", (dup["id"],)).fetchone()[0]
             return {"id": dup["id"], "chunks": n, "duplicate": True}
@@ -155,7 +161,7 @@ class Store:
 
     def documents(self, course_id: int) -> list[dict]:
         rows = self.db.execute("""
-            SELECT d.id, d.name, d.added, COUNT(c.id) AS chunks
+            SELECT d.id, d.name, d.added, COUNT(c.id) AS chunks, d.data IS NOT NULL AS has_source
             FROM documents d LEFT JOIN chunks c ON c.doc_id = d.id
             WHERE d.course_id = ? GROUP BY d.id ORDER BY d.added, d.id""", (course_id,)).fetchall()
         return [dict(r) for r in rows]

@@ -156,6 +156,19 @@ def test_duplicate_upload_is_detected(course):
     assert r["duplicate"]
 
 
+def test_reupload_rebuilds_legacy_document_and_reprocess():
+    s = Store()
+    cid = s.create_course("x")
+    data = "# A\n\nРанг — максимальное число линейно независимых строк матрицы.".encode()
+    d = s.add_document(cid, "a.md", data)
+    s.db.execute("UPDATE documents SET data = NULL WHERE id = ?", (d["id"],))  # как у документов старой версии
+    with pytest.raises(ValueError):
+        s.reprocess(d["id"])
+    r = s.add_document(cid, "a.md", data)
+    assert r["reprocessed"] and r["id"] == d["id"]
+    assert s.reprocess(d["id"])["chunks"] == 1
+
+
 def test_delete_document_removes_chunks_and_cards():
     s = Store()
     cid = s.create_course("x")
