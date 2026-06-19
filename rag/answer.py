@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass, field
 
 from . import llm
 from .retrieval import Hit, HybridIndex
+from .synonyms import expand
 from .text import sentences, tokenize
 
 DEFINITION = re.compile(r"\s[—–-]\s|\bэто\b|\bназывает|\bназывают|\bопределяется")
@@ -120,7 +121,8 @@ def answer(question: str, index: HybridIndex, k: int = 4, use_llm: bool | None =
         return Answer(question, NOT_FOUND, "none", _sources(hits[:2]),
                       ["похожих фрагментов почти нет — возможно, этой темы нет в загруженных конспектах"])
     sources = _sources(hits)
-    fallback = extractive(question, hits, index.bm25.idf)
+    # предложения ищу по вопросу вместе с синонимами: на «momentum» ответ в конспекте написан про «импульс»
+    fallback = extractive(expand(question, index.synonyms), hits, index.bm25.idf)
     if use_llm is None:
         use_llm = llm.enabled() or call is not None
     if not use_llm:

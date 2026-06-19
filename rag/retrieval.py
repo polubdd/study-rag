@@ -24,7 +24,7 @@ from . import llm
 from .bm25 import BM25
 from .chunk import Chunk
 from .synonyms import build_map, expand
-from .text import normalize
+from .text import normalize, tokenize
 
 
 @dataclass
@@ -82,13 +82,28 @@ class HybridIndex:
         top = np.argsort(-fused, kind="stable")[:k]
         return [Hit(self.chunks[i], round(float(fused[i]), 5), {n: int(r[i]) + 1 for n, r in ranks.items()}) for i in top]
 
+    def _coverage(self, query: str) -> float:
+        """Доля слов вопроса, которые есть в конспектах — сами или через синоним.
+
+        Считать покрытие по расширенному запросу нельзя: «momentum» + синоним «импульс»
+        дают 1 из 2, хотя вопрос полностью про то, что есть в конспекте.
+        """
+        toks = set(tokenize(query))
+        if not toks:
+            return 0.0
+        covered = 0
+        for t in toks:
+            alts = {t} | {s for syn in self.synonyms.get(t, ()) for s in tokenize(syn)}
+            covered += any(a in self.bm25.idf for a in alts)
+        return covered / len(toks)
+
     def is_answerable(self, query: str, hits: list[Hit]) -> bool:
         """Есть ли в конспектах хоть что-то по вопросу."""
         if not hits:
             return False
-        query = expand(query, self.synonyms)
-        best_bm25 = max(self.bm25.scores(query))
-        best_chars = float(cosine_similarity(self.tfidf.transform([query]), self.X)[0].max())
-        cov = self.bm25.coverage(query)
+        expanded = expand(query, self.synonyms)
+        best_bm25 = max(self.bm25.scores(expanded))
+        best_chars = float(cosine_similarity(self.tfidf.transform([expanded]), self.X)[0].max())
+        cov = self._coverage(query)
         # в маленьком курсе idf низкий у всех слов, поэтому высокое покрытие запроса — достаточный сигнал
         return cov >= 0.34 and (best_bm25 >= 2.0 or best_chars >= 0.25 or cov >= 0.67)
