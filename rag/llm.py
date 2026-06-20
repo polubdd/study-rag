@@ -1,41 +1,45 @@
-"""Генерация ответа через любой OpenAI-совместимый API (Ollama, vLLM, облако).
+"""Клиент к любому OpenAI-совместимому API (Ollama, vLLM, облачные провайдеры).
 
-Если переменная LLM_BASE_URL не задана, LLM не вызывается и пользователь
-получает найденные фрагменты конспекта. Поиск полезен и сам по себе.
+LLM_BASE_URL   — например http://localhost:11434/v1 для Ollama
+LLM_MODEL      — модель для ответов (по умолчанию qwen2.5:7b)
+EMBED_MODEL    — модель эмбеддингов (например bge-m3); без неё поиск гибридный без векторов
+LLM_API_KEY    — если нужен
+
+Без LLM_BASE_URL ничего не вызывается: поиск, экстрактивные ответы и карточки
+работают на собственных алгоритмах.
 """
 import json
 import os
 import urllib.request
 
-from .chunk import Chunk
 
-PROMPT = """Ты помогаешь студенту готовиться к экзамену.
-Отвечай ТОЛЬКО по фрагментам конспекта ниже. Если ответа в них нет — так и скажи.
-После каждого утверждения ставь номер фрагмента в квадратных скобках.
-
-{context}
-
-Вопрос: {question}"""
+def enabled() -> bool:
+    return bool(os.getenv("LLM_BASE_URL"))
 
 
-def build_prompt(question: str, chunks: list[Chunk]) -> str:
-    context = "\n\n".join(f"[{i + 1}] ({c.section})\n{c.text}" for i, c in enumerate(chunks))
-    return PROMPT.format(context=context, question=question)
+def embeddings_enabled() -> bool:
+    return enabled() and bool(os.getenv("EMBED_MODEL"))
 
 
-def ask(question: str, chunks: list[Chunk]) -> str | None:
-    base = os.getenv("LLM_BASE_URL")  # например http://localhost:11434/v1 для Ollama
-    if not base:
-        return None
-    body = {
-        "model": os.getenv("LLM_MODEL", "qwen2.5:7b"),
-        "messages": [{"role": "user", "content": build_prompt(question, chunks)}],
-        "temperature": 0.1,
-    }
+def _post(path: str, body: dict, timeout=120) -> dict:
     req = urllib.request.Request(
-        base.rstrip("/") + "/chat/completions",
+        os.environ["LLM_BASE_URL"].rstrip("/") + path,
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {os.getenv('LLM_API_KEY', 'none')}"},
     )
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.load(r)["choices"][0]["message"]["content"]
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def chat(prompt: str, temperature: float = 0.1) -> str:
+    body = {"model": os.getenv("LLM_MODEL", "qwen2.5:7b"), "temperature": temperature,
+            "messages": [{"role": "user", "content": prompt}]}
+    return _post("/chat/completions", body)["choices"][0]["message"]["content"]
+
+
+def embed(texts: list[str]) -> list[list[float]]:
+    out = []
+    for i in range(0, len(texts), 64):
+        r = _post("/embeddings", {"model": os.environ["EMBED_MODEL"], "input": texts[i:i + 64]})
+        out += [d["embedding"] for d in sorted(r["data"], key=lambda d: d["index"])]
+    return out

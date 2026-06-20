@@ -1,0 +1,86 @@
+"""Гибридный поиск по фрагментам конспекта.
+
+Три ранжирования, объединённые через Reciprocal Rank Fusion:
+- BM25 по стемам — точно находит термины («ранг», «ЦПТ»);
+- TF-IDF по символьным n-граммам — переживает опечатки и словоформы,
+  которые грубый стеммер не свёл («обращение» / «обратная»);
+- эмбеддинги (если подключены) — находят синонимы и перефразировки.
+
+RRF складывает не скоры, а ранги: 1/(k + rank). Скоры у трёх методов
+в разных шкалах, а ранги сравнимы, и ничего не нужно нормировать.
+
+Отдельно решается вопрос «в конспектах этого вообще нет». Поиск всегда
+что-то вернёт, поэтому без проверки студент получит уверенный ответ не по
+теме. Проверка: доля слов запроса, которые есть в корпусе, и абсолютный
+скор BM25 лучшего фрагмента.
+"""
+from dataclasses import dataclass
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+from . import llm
+from .bm25 import BM25
+from .chunk import Chunk
+from .text import normalize
+
+
+@dataclass
+class Hit:
+    chunk: Chunk
+    score: float
+    ranks: dict
+
+
+class HybridIndex:
+    def __init__(self, chunks: list[Chunk], rrf_k: int = 60, use_embeddings: bool | None = None,
+                 methods: tuple[str, ...] = ("bm25", "chars", "dense")):
+        self.chunks = chunks
+        self.rrf_k = rrf_k
+        self.methods = methods
+        # заголовок раздела добавляю к тексту: часто термин есть только в нём
+        texts = [f"{c.section}\n{c.text}" for c in chunks]
+        self.bm25 = BM25(texts)
+        self.tfidf = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), preprocessor=normalize, sublinear_tf=True)
+        self.X = self.tfidf.fit_transform(texts) if texts else None
+        if use_embeddings is None:
+            use_embeddings = llm.embeddings_enabled()
+        self.E = None
+        if use_embeddings and texts and "dense" in methods:
+            E = np.array(llm.embed(texts), dtype=np.float32)
+            self.E = E / np.linalg.norm(E, axis=1, keepdims=True)
+
+    def _rankings(self, query: str) -> dict[str, np.ndarray]:
+        out = {}
+        if "bm25" in self.methods:
+            out["bm25"] = np.array(self.bm25.scores(query))
+        if "chars" in self.methods:
+            out["chars"] = cosine_similarity(self.tfidf.transform([query]), self.X)[0]
+        if self.E is not None:
+            q = np.array(llm.embed([query])[0], dtype=np.float32)
+            out["dense"] = self.E @ (q / np.linalg.norm(q))
+        return out
+
+    def search(self, query: str, k: int = 4) -> list[Hit]:
+        if not self.chunks or not query.strip():
+            return []
+        scores = self._rankings(query)
+        fused = np.zeros(len(self.chunks))
+        ranks = {}
+        for name, s in scores.items():
+            order = np.argsort(-s, kind="stable")
+            r = np.empty(len(s), dtype=int)
+            r[order] = np.arange(len(s))
+            ranks[name] = r
+            fused += 1 / (self.rrf_k + r + 1)
+        top = np.argsort(-fused, kind="stable")[:k]
+        return [Hit(self.chunks[i], round(float(fused[i]), 5), {n: int(r[i]) + 1 for n, r in ranks.items()}) for i in top]
+
+    def is_answerable(self, query: str, hits: list[Hit]) -> bool:
+        """Есть ли в конспектах хоть что-то по вопросу."""
+        if not hits:
+            return False
+        best_bm25 = max(self.bm25.scores(query)) if "bm25" in self.methods else 0
+        best_chars = float(cosine_similarity(self.tfidf.transform([query]), self.X)[0].max())
+        return self.bm25.coverage(query) >= 0.34 and (best_bm25 >= 2.0 or best_chars >= 0.25)
