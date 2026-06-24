@@ -89,4 +89,6 @@ class HybridIndex:
         query = expand(query, self.synonyms)
         best_bm25 = max(self.bm25.scores(query))
         best_chars = float(cosine_similarity(self.tfidf.transform([query]), self.X)[0].max())
-        return self.bm25.coverage(query) >= 0.34 and (best_bm25 >= 2.0 or best_chars >= 0.25)
+        cov = self.bm25.coverage(query)
+        # в маленьком курсе idf низкий у всех слов, поэтому высокое покрытие запроса — достаточный сигнал
+        return cov >= 0.34 and (best_bm25 >= 2.0 or best_chars >= 0.25 or cov >= 0.67)

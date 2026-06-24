@@ -4,6 +4,7 @@ SQLite, а не векторная БД: конспекты одного сту�
 индекс в памяти строится за доли секунды, а один файл легко бэкапить.
 """
 import hashlib
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,9 @@ CREATE TABLE IF NOT EXISTS cards (
 CREATE TABLE IF NOT EXISTS reviews (
     id INTEGER PRIMARY KEY, card_id INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
     at TEXT NOT NULL, grade INTEGER NOT NULL, interval REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS synonyms (
+    course_id INTEGER PRIMARY KEY REFERENCES courses(id) ON DELETE CASCADE, groups TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_chunks_doc ON chunks(doc_id);
 CREATE INDEX IF NOT EXISTS ix_cards_due ON cards(course_id, due);
@@ -159,6 +163,22 @@ class Store:
 
     def version(self, course_id: int) -> int:
         return self.versions.get(course_id, 0)
+
+    # --- синонимы курса: [["полнота", "recall"], ...]
+
+    def synonyms(self, course_id: int) -> list[list[str]]:
+        r = self.db.execute("SELECT groups FROM synonyms WHERE course_id = ?", (course_id,)).fetchone()
+        return json.loads(r["groups"]) if r else []
+
+    def set_synonyms(self, course_id: int, groups: list[list[str]]):
+        clean = [[t.strip() for t in g if t.strip()] for g in groups]
+        clean = [g for g in clean if len(g) >= 2]
+        with self.tx() as db:
+            db.execute("INSERT INTO synonyms(course_id, groups) VALUES (?, ?) "
+                       "ON CONFLICT(course_id) DO UPDATE SET groups = excluded.groups",
+                       (course_id, json.dumps(clean, ensure_ascii=False)))
+        self._bump(course_id)
+        return clean
 
     # --- карточки
 
