@@ -6,7 +6,7 @@ SQLite, а не векторная БД: конспекты одного сту�
 import hashlib
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .chunk import Chunk, split_markdown
@@ -43,7 +43,12 @@ CREATE INDEX IF NOT EXISTS ix_cards_due ON cards(course_id, due);
 
 
 def now() -> str:
+    # даты храню строками ISO в UTC: так их можно сравнивать прямо в SQL как строки
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def week_ago() -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=7)).isoformat(timespec="seconds")
 
 
 class Store:
@@ -154,3 +159,61 @@ class Store:
 
     def version(self, course_id: int) -> int:
         return self.versions.get(course_id, 0)
+
+    # --- карточки
+
+    def add_cards(self, course_id: int, cards) -> int:
+        """Новые карточки сразу доступны к повторению. Уже существующие (тот же вопрос) не трогаются:
+        иначе повторная генерация сбросила бы прогресс."""
+        with self.tx() as db:
+            before = db.total_changes
+            db.executemany(
+                "INSERT OR IGNORE INTO cards(course_id, chunk_id, kind, term, front, back, due) VALUES (?,?,?,?,?,?,?)",
+                [(course_id, c.chunk_id, c.kind, c.term, c.front, c.back, now()) for c in cards])
+            return db.total_changes - before
+
+    def cards(self, course_id: int, due_only: bool = False, limit: int = 1000) -> list[dict]:
+        q = "SELECT * FROM cards WHERE course_id = ? AND suspended = 0"
+        args: list = [course_id]
+        if due_only:
+            q += " AND due <= ?"
+            args.append(now())
+        q += " ORDER BY due, id LIMIT ?"
+        args.append(limit)
+        return [dict(r) for r in self.db.execute(q, args).fetchall()]
+
+    def card(self, card_id: int) -> dict | None:
+        r = self.db.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
+        return dict(r) if r else None
+
+    def review(self, card_id: int, grade: int, at=None) -> dict:
+        from .srs import State, schedule
+        c = self.card(card_id)
+        if not c:
+            raise KeyError(card_id)
+        st, due = schedule(State(c["ease"], c["interval"], c["reps"], c["lapses"]), grade, at)
+        with self.tx() as db:
+            db.execute("UPDATE cards SET ease=?, interval=?, reps=?, lapses=?, due=? WHERE id=?",
+                       (st.ease, st.interval, st.reps, st.lapses, due.isoformat(timespec="seconds"), card_id))
+            db.execute("INSERT INTO reviews(card_id, at, grade, interval) VALUES (?,?,?,?)",
+                       (card_id, (at.isoformat(timespec="seconds") if at else now()), grade, st.interval))
+        return self.card(card_id)
+
+    def suspend_card(self, card_id: int):
+        with self.tx() as db:
+            if not db.execute("UPDATE cards SET suspended = 1 WHERE id = ?", (card_id,)).rowcount:
+                raise KeyError(card_id)
+
+    def progress(self, course_id: int) -> dict:
+        r = self.db.execute("""
+            SELECT COUNT(*) AS total,
+                   SUM(reps = 0) AS new,
+                   SUM(reps > 0 AND interval < 21) AS learning,
+                   SUM(interval >= 21) AS mature,
+                   SUM(due <= ?) AS due
+            FROM cards WHERE course_id = ? AND suspended = 0""", (now(), course_id)).fetchone()
+        last = self.db.execute("""
+            SELECT COUNT(*) AS n, AVG(grade > 0) AS ok FROM reviews r JOIN cards c ON c.id = r.card_id
+            WHERE c.course_id = ? AND r.at >= ?""", (course_id, week_ago())).fetchone()
+        return {k: int(r[k] or 0) for k in ("total", "new", "learning", "mature", "due")} | {
+            "reviews_7d": int(last["n"] or 0), "recall_7d": round(float(last["ok"]), 2) if last["ok"] is not None else None}
