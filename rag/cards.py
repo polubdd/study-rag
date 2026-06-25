@@ -56,7 +56,10 @@ def _is_concept(term: str) -> bool:
     ws = [w.lower() for w in re.findall(r"[А-ЯЁа-яёA-Za-z]+", term)]
     if not ws or term.lower() in GENERIC:
         return False
-    return not any(w in STOP or w in {"её", "ее", "его", "нельзя", "можно", "нужно", "проще", "всего"} for w in ws) \
+    # «Обратное неверно: …», «Следовательно: …» — связки рассуждения, а не понятия
+    filler = {"её", "ее", "его", "нельзя", "можно", "нужно", "проще", "всего", "верно", "неверно", "обратное",
+              "справедливо", "следовательно", "аналогично", "заметим", "тогда", "поэтому", "отсюда", "значит"}
+    return not any(w in STOP or w in filler for w in ws) \
         and not any(len(w) > 4 and VERBISH.search(w) and not w.endswith(("ость", "ность")) for w in ws if re.match("[а-яё]", w))
 
 
